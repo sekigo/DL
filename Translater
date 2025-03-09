@@ -1,0 +1,518 @@
+
+
+print('Data source import complete.')
+
+!pip uninstall -y torch torchtext
+!pip install torch==2.3.0
+!pip install torchtext==0.18
+!pip install sacrebleu
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torchtext
+from torch.utils.data import DataLoader, Dataset
+from torchtext.vocab import build_vocab_from_iterator
+from torch.nn.utils.rnn import pad_sequence
+import re
+import sentencepiece as spm
+import pandas as pd
+from typing import Union, List, Tuple
+from sentencepiece import SentencePieceTrainer, SentencePieceProcessor
+from sklearn.model_selection import train_test_split
+import os
+import numpy as np
+import torch
+from typing import Type, Optional, Any
+from torch import nn
+import torch.nn.functional as F
+import numpy as np
+from tqdm import tqdm
+import torch
+from typing import Type
+from torch import nn
+import torch.nn.functional as F
+import numpy as np
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torchtext
+from torch.utils.data import DataLoader, Dataset
+from torchtext.vocab import build_vocab_from_iterator
+from torch.nn.utils.rnn import pad_sequence
+import re
+import sentencepiece as spm
+import pandas as pd
+from typing import Union, List, Tuple
+from sentencepiece import SentencePieceTrainer, SentencePieceProcessor
+from sklearn.model_selection import train_test_split
+import os
+import numpy as np
+
+DEBUG_MODE = False
+START_TOKEN = 2
+SEQ_MAX_LENGTH = 128
+
+class TextDataset(Dataset):
+    def __init__(self, german_file: str, english_file: str = None,
+                 is_training: bool = True, tokenizer_prefix: str = None,
+                 vocab_capacity: int = 10000, norm_rule: str = 'nmt_nfkc_cf',
+                 token_model: str = 'word', seq_max_len: int = 128):
+        if not os.path.isfile(tokenizer_prefix + 'german.model'):
+            SentencePieceTrainer.train(
+                input=german_file, vocab_size=vocab_capacity,
+                model_type=token_model, model_prefix=tokenizer_prefix + 'german',
+                normalization_rule_name=norm_rule,
+                pad_id=0, unk_id=1, bos_id=2, eos_id=3
+            )
+
+            SentencePieceTrainer.train(
+                input=english_file, vocab_size=vocab_capacity,
+                model_type=token_model, model_prefix=tokenizer_prefix + 'english',
+                normalization_rule_name=norm_rule,
+                pad_id=0, unk_id=1, bos_id=2, eos_id=3
+            )
+
+        self.tokenizer_de = SentencePieceProcessor(model_file=tokenizer_prefix + 'german.model')
+        self.tokenizer_en = SentencePieceProcessor(model_file=tokenizer_prefix + 'english.model')
+
+        with open(german_file, encoding='utf-8') as file:
+            text_german = file.readlines()
+
+        total_sentences = len(text_german) if not DEBUG_MODE else min(len(text_german), 500)
+        print('Total sentences:', total_sentences)
+
+        self.texts_de = text_german[:total_sentences]
+        self.indices_de = self.tokenizer_de.encode(self.texts_de)
+
+        if english_file is not None:
+            with open(english_file, encoding='utf-8') as file:
+                text_english = file.readlines()
+
+            self.texts_en = text_english[:total_sentences]
+            self.indices_en = self.tokenizer_en.encode(self.texts_en)
+        else:
+            self.texts_en = None
+            self.indices_en = None
+
+        self.pad_token, self.unk_token, self.start_token, self.end_token = (
+            self.tokenizer_en.pad_id(), self.tokenizer_en.unk_id(),
+            self.tokenizer_en.bos_id(), self.tokenizer_en.eos_id()
+        )
+        self.seq_max_len = seq_max_len
+
+        self.vocab_size_en = self.tokenizer_en.vocab_size()
+        self.vocab_size_de = self.tokenizer_de.vocab_size()
+
+    def encode_text(self, texts: Union[str, List[str]], lang: str = 'English') -> Union[List[int], List[List[int]]]:
+        return self.tokenizer_en.encode(texts) if lang == 'English' else self.tokenizer_de.encode(texts)
+
+    def decode_ids(self, indices: Union[torch.Tensor, List[int], List[List[int]]], lang: str = 'English') -> Union[str, List[str]]:
+        if torch.is_tensor(indices):
+            indices = indices.cpu().tolist()
+        return self.tokenizer_en.decode(indices) if lang == 'English' else self.tokenizer_de.decode(indices)
+
+    def __len__(self):
+        return len(self.indices_de)
+
+    def process_sentence(self, sentence: str, lang='English'):
+        tokens = [self.start_token] + self.encode_text(sentence, lang) + [self.end_token]
+        tokens = tokens[:self.seq_max_len] + [self.pad_token] * max(0, self.seq_max_len - len(tokens))
+        return tokens
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        x_tokens = self.process_sentence(self.texts_de[idx], lang='German')
+
+        if self.texts_en is not None:
+            y_tokens = self.process_sentence(self.texts_en[idx], lang='English')
+        else:
+            return torch.tensor(x_tokens, dtype=torch.long), torch.zeros(self.seq_max_len, dtype=torch.long)
+
+        return torch.tensor(x_tokens, dtype=torch.long), torch.tensor(y_tokens, dtype=torch.long)
+
+from torch import Tensor
+import torch
+import torch.nn as nn
+from torch.nn import Transformer
+import math
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# helper Module that adds positional encoding to the token embedding to introduce a notion of word order.
+class PositionalEncoding(nn.Module):
+    def __init__(self,
+                 emb_size: int,
+                 dropout: float,
+                 maxlen: int = 5000):
+        super(PositionalEncoding, self).__init__()
+        den = torch.exp(- torch.arange(0, emb_size, 2)* math.log(10000) / emb_size)
+        pos = torch.arange(0, maxlen).reshape(maxlen, 1)
+        pos_embedding = torch.zeros((maxlen, emb_size))
+        pos_embedding[:, 0::2] = torch.sin(pos * den)
+        pos_embedding[:, 1::2] = torch.cos(pos * den)
+        pos_embedding = pos_embedding.unsqueeze(-2)
+
+        self.dropout = nn.Dropout(dropout)
+        self.register_buffer('pos_embedding', pos_embedding)
+
+    def forward(self, token_embedding: Tensor):
+        print(f"Max pos_embedding: {self.pos_embedding.max()}, Min: {self.pos_embedding.min()}")
+
+        return self.dropout(token_embedding + self.pos_embedding[:token_embedding.size(0), :])
+
+# helper Module to convert tensor of input indices into corresponding tensor of token embeddings
+class TokenEmbedding(nn.Module):
+    def __init__(self, vocab_size: int, emb_size):
+        super(TokenEmbedding, self).__init__()
+        self.embedding = nn.Embedding(vocab_size, emb_size)
+        self.emb_size = emb_size
+
+    def forward(self, tokens: Tensor):
+        return self.embedding(tokens.long()) * math.sqrt(self.emb_size)
+
+# Seq2Seq Network
+class Seq2SeqTransformer(nn.Module):
+    def __init__(self,
+                 num_encoder_layers: int,
+                 num_decoder_layers: int,
+                 emb_size: int,
+                 nhead: int,
+                 src_vocab_size: int,
+                 tgt_vocab_size: int,
+                 dim_feedforward: int = 512,
+                 dropout: float = 0.1):
+        super(Seq2SeqTransformer, self).__init__()
+        self.transformer = Transformer(d_model=emb_size,
+                                       nhead=nhead,
+                                       num_encoder_layers=num_encoder_layers,
+                                       num_decoder_layers=num_decoder_layers,
+                                       dim_feedforward=dim_feedforward,
+                                       dropout=dropout)
+        self.generator = nn.Linear(emb_size, tgt_vocab_size)
+        self.src_tok_emb = TokenEmbedding(src_vocab_size, emb_size)
+        self.tgt_tok_emb = TokenEmbedding(tgt_vocab_size, emb_size)
+        self.positional_encoding = PositionalEncoding(
+            emb_size, dropout=dropout)
+        self.norm = nn.LayerNorm(emb_size, eps=1e-3)
+
+    def forward(self, src, tgt, src_mask, tgt_mask, src_padding_mask, tgt_padding_mask, memory_key_padding_mask):
+        src_emb = self.positional_encoding(self.src_tok_emb(src))
+        print(f"🔥 После `positional_encoding`: Max={src_emb.max()}, Min={src_emb.min()}")
+        # if torch.isnan(tgt).any():
+        #     print("⚠️ `tgt` уже содержит NaN перед `tgt_tok_emb`!")
+        # print(f"⚠️ tgt_tok_emb веса: Max={self.tgt_tok_emb.embedding.weight.max()}, Min={self.tgt_tok_emb.embedding.weight.min()}")
+
+        # print(f"⚠️ `tgt` min={tgt.min()}, max={tgt.max()}, shape={tgt.shape}")
+
+        tgt_emb = self.positional_encoding(self.tgt_tok_emb(tgt))
+        print(f"🔥 После `tgt_tok_emb`: Max={tgt_emb.max()}, Min={tgt_emb.min()}")
+
+        memory = self.transformer.encoder(src_emb, src_mask, src_padding_mask)
+        print(f"🔥 После `encoder`: Max={memory.max()}, Min={memory.min()}")
+        # if torch.isnan(tgt_emb).any():
+        #     print("⚠️ `tgt` уже содержит NaN перед `tgt_tok_emb`!")
+
+
+        outs = self.transformer.decoder(tgt_emb, memory, tgt_mask, None, tgt_padding_mask, memory_key_padding_mask)
+        print(f"🔥 После `decoder`: Max={outs.max()}, Min={outs.min()}")
+
+        outs = self.norm(outs)
+        print(f"🔥 После `LayerNorm`: Max={outs.max()}, Min={outs.min()}")
+
+        logits = self.generator(outs)
+        print(f"🔥 После `Linear (generator)`: Max={logits.max()}, Min={logits.min()}")
+        # print(f"⚠️ tgt_tok_emb веса: Max={self.tgt_tok_emb.embedding.weight.max()}, Min={self.tgt_tok_emb.embedding.weight.min()}")
+
+
+        return logits
+
+    def encode(self, src: Tensor, src_mask: Tensor):
+        return self.transformer.encoder(self.positional_encoding(
+                            self.src_tok_emb(src)), src_mask)
+
+    def decode(self, tgt: Tensor, memory: Tensor, tgt_mask: Tensor):
+        if torch.isnan(tgt).any():
+            print("⚠️ `tgt` уже содержит NaN перед `tgt_tok_emb`!")
+
+        return self.transformer.decoder(self.positional_encoding(
+                          self.tgt_tok_emb(tgt)), memory,
+                          tgt_mask)
+
+def generate_square_subsequent_mask(sz):
+    mask = (torch.triu(torch.ones((sz, sz), device=DEVICE)) == 1).transpose(0, 1)
+    mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
+    return mask
+
+
+def create_mask(src, tgt):
+    src_seq_len = src.shape[0]
+    tgt_seq_len = tgt.shape[0]
+
+    tgt_mask = generate_square_subsequent_mask(tgt_seq_len)
+    src_mask = torch.zeros((src_seq_len, src_seq_len),device=DEVICE).type(torch.bool)
+
+    src_padding_mask = (src == PAD_IDX).transpose(0, 1)
+    tgt_padding_mask = (tgt == PAD_IDX).transpose(0, 1)
+    return src_mask, tgt_mask, src_padding_mask, tgt_padding_mask
+
+
+
+SRC_LANGUAGE = "de"
+TGT_LANGUAGE = "en"
+
+from tqdm import tqdm
+def train_epoch(model, optimizer, train_data_loader):
+    model.train()
+    losses = 0
+
+
+
+    for src, tgt in tqdm(train_data_loader, desc="Processing"):
+        # print("YES")
+        # if torch.isnan(tgt).any():
+        #     print("⚠️ `tgt` уже содержит NaN перед разбиением!")
+
+        src = src.to(DEVICE)
+        tgt = tgt.to(DEVICE)
+        # print(tgt.shape, tgt)
+        tgt_input = tgt[:-1, :]
+
+        src_mask, tgt_mask, src_padding_mask, tgt_padding_mask = create_mask(src, tgt_input)
+
+
+
+        logits = model(src, tgt_input, src_mask, tgt_mask,src_padding_mask, tgt_padding_mask, memory_key_padding_mask=src_padding_mask)
+        # print(logits.shape, tgt.shape)
+        # print(logits[0])
+        print(f"Max src: {src.max()}, Min: {src.min()}")
+        print(f"Max tgt_input: {tgt_input.max()}, Min: {tgt_input.min()}")
+
+        optimizer.zero_grad()
+
+        tgt_out = tgt[1:, :]
+        # logits = torch.nan_to_num(logits, nan=0.0, posinf=1.0, neginf=-1.0)
+        # if torch.isnan(logits).any():
+        #     print("⚠️ `logits` содержит NaN перед `loss_fn`!")
+        # print(f"⚠️ Logits min={logits.min()}, max={logits.max()}, mean={logits.mean()}")
+        if torch.isnan(logits).any():
+            print("⚠️ Ошибка! `logits` содержит NaN перед `loss_fn`!")
+
+        loss = loss_fn(logits.reshape(-1, logits.shape[-1]), tgt_out.reshape(-1))
+        # if torch.isnan(loss):
+        #     print("⚠️ Ошибка! `loss` содержит NaN перед `backward()`!")
+
+        loss.backward()
+
+        # for name, param in model.named_parameters():
+        #     if param.grad is not None and torch.isnan(param.grad).any():
+        #         print(f"⚠️ Градиенты содержат NaN в {name}!")
+
+        # ✅ Ограничиваем градиенты перед `optimizer.step()`
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.01)
+
+        # for param in model.parameters():
+        #     if param.grad is not None:
+        #         print(f"{param.shape}: {torch.norm(param.grad)}")
+
+        optimizer.step()
+        # for name, param in transformer.named_parameters():
+        #     if "tgt_tok_emb.embedding.weight" in name and torch.isnan(param).any():
+        #         print(f"⚠️ {name} стал NaN после обновления весов!")
+
+        losses += loss.item()
+
+    return losses / len(list(train_data_loader))
+
+
+def evaluate(model,val_data_loader):
+    model.eval()
+    losses = 0
+
+    for src, tgt in tqdm(val_data_loader, desc="Valueting"):
+        src = src.to(DEVICE)
+        tgt = tgt.to(DEVICE)
+
+        tgt_input = tgt[:-1, :]
+
+        src_mask, tgt_mask, src_padding_mask, tgt_padding_mask = create_mask(src, tgt_input)
+
+        logits = model(src, tgt_input, src_mask, tgt_mask,src_padding_mask, tgt_padding_mask, src_padding_mask)
+
+        tgt_out = tgt[1:, :]
+        logits = torch.nan_to_num(logits, nan=0.0, posinf=1.0, neginf=-1.0)
+
+        loss = loss_fn(logits.reshape(-1, logits.shape[-1]), tgt_out.reshape(-1))
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        losses += loss.item()
+
+    return losses / len(list(val_data_loader))
+
+import torch
+
+def save_model(model, optimizer, epoch, loss, path="model.pth"):
+    """
+    Сохраняет модель, оптимизатор и метаданные.
+
+    :param model: torch.nn.Module - обученная модель
+    :param optimizer: torch.optim.Optimizer - оптимизатор
+    :param epoch: int - номер эпохи
+    :param loss: float - значение функции потерь
+    :param path: str - путь для сохранения файла
+    """
+    checkpoint = {
+        f'model_state_dict{epoch}': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'epoch': epoch,
+        'loss': loss
+    }
+    torch.save(checkpoint, path)
+    print(f"Модель сохранена в {path}")
+
+from timeit import default_timer as timer
+NUM_EPOCHS = 18
+
+torch.manual_seed(0)
+BATCH_SIZE = 128
+train_dataset = TextDataset(
+        german_file='/kaggle/input/dataset/train.de-en.de', tokenizer_prefix='tokenizer_',
+        english_file='/kaggle/input/dataset/train.de-en.en', is_training=True
+    )
+
+train_data_loader = torch.utils.data.DataLoader(
+        train_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False
+    )
+
+valid_dataset = TextDataset(
+        german_file='/kaggle/input/dataset/val.de-en.de', tokenizer_prefix='tokenizer_',
+        english_file='/kaggle/input/dataset/val.de-en.en', is_training=False
+    )
+
+
+val_data_loader = torch.utils.data.DataLoader(
+        valid_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False
+    )
+
+UNK_IDX, PAD_IDX, BOS_IDX, EOS_IDX = 0, 1, 2, 3
+
+SRC_VOCAB_SIZE = train_dataset.vocab_size_de
+TGT_VOCAB_SIZE = valid_dataset.vocab_size_en
+EMB_SIZE = 512
+NHEAD = 8
+FFN_HID_DIM = 512
+
+NUM_ENCODER_LAYERS = 3
+NUM_DECODER_LAYERS = 3
+
+transformer = Seq2SeqTransformer(NUM_ENCODER_LAYERS, NUM_DECODER_LAYERS, EMB_SIZE,
+                                 NHEAD, SRC_VOCAB_SIZE, TGT_VOCAB_SIZE, FFN_HID_DIM)
+for name, param in transformer.named_parameters():
+    if "tok_emb" in name and torch.isnan(param).any():
+        print(f"⚠️ {name} содержит NaN перед обучением!")
+
+
+for p in transformer.parameters():
+    if p.dim() > 1:
+        nn.init.xavier_uniform_(p)
+
+transformer = transformer.to(DEVICE)
+
+loss_fn = torch.nn.CrossEntropyLoss(ignore_index=PAD_IDX)
+
+optimizer = torch.optim.Adam(transformer.parameters(), lr=0.0001, betas=(0.9, 0.98), eps=1e-9)
+
+for name, param in transformer.named_parameters():
+    if "tgt_tok_emb.embedding.weight" in name and torch.isnan(param).any():
+        print(f"⚠️ {name} уже содержит NaN перед началом обучения!")
+
+for batch in train_data_loader:
+    inputs, targets = batch
+    print(inputs.shape, targets.shape)
+    print(inputs[0], targets[0])  # Вывод первых примеров
+    break
+
+pad_count = (targets == PAD_IDX).sum().item()
+total_count = targets.numel()
+print(f"PAD токенов: {pad_count}/{total_count} ({(pad_count/total_count)*100:.2f}%)")
+
+for epoch in range(1, NUM_EPOCHS+1):
+    start_time = timer()
+    train_loss = train_epoch(transformer, optimizer, train_data_loader)
+    end_time = timer()
+    val_loss = evaluate(transformer,val_data_loader)
+    print((f"Epoch: {epoch}, Train loss: {train_loss:.3f}, Val loss: {val_loss:.3f}, "f"Epoch time = {(end_time - start_time):.3f}s"))
+    if epoch % 2 == 0:
+        save_model(transformer, optimizer, epoch, loss_fn)
+
+# function to generate output sequence using greedy algorithm
+def greedy_decode(model, src, src_mask, max_len, start_symbol):
+    src = src.to(DEVICE)
+    src_mask = src_mask.to(DEVICE)
+
+    memory = model.encode(src, src_mask)
+    ys = torch.ones(1, 1).fill_(start_symbol).type(torch.long).to(DEVICE)
+    for i in range(max_len-1):
+        memory = memory.to(DEVICE)
+        tgt_mask = (generate_square_subsequent_mask(ys.size(0))
+                    .type(torch.bool)).to(DEVICE)
+        out = model.decode(ys, memory, tgt_mask)
+        out = out.transpose(0, 1)
+        prob = model.generator(out[:, -1])
+        _, next_word = torch.max(prob, dim=1)
+        next_word = next_word.item()
+
+        ys = torch.cat([ys,
+                        torch.ones(1, 1).type_as(src.data).fill_(next_word)], dim=0)
+        if next_word == EOS_IDX:
+            break
+    return ys
+
+
+# actual function to translate input sentence into target language
+def translate(model: torch.nn.Module, src_sentence: str):
+    model.eval()
+    src = text_transform[SRC_LANGUAGE](src_sentence).view(-1, 1)
+    num_tokens = src.shape[0]
+    src_mask = (torch.zeros(num_tokens, num_tokens)).type(torch.bool)
+    tgt_tokens = greedy_decode(
+        model,  src, src_mask, max_len=num_tokens + 5, start_symbol=BOS_IDX).flatten()
+    return " ".join(vocab_transform[TGT_LANGUAGE].lookup_tokens(list(tgt_tokens.cpu().numpy()))).replace("<bos>", "").replace("<eos>", "")
+# print(translate(transformer, "Eine Gruppe von Menschen steht vor einem Iglu ."))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
